@@ -2,9 +2,8 @@
 export default async function handler(req, res) {
   // ===== CORS =====
   const ALLOWED = [
-    "https://SEU-APP.goodbarber.app",     // ✅ troque para o domínio do seu PWA
-    "https://app.seu-dominio.com"         // ✅ se você usa domínio customizado
-  ];
+    "https://allergyvax.com",     // ✅ troque para o domínio do seu PWA
+     ];
   const origin = req.headers.origin || "";
   res.setHeader("Access-Control-Allow-Origin", ALLOWED.includes(origin) ? origin : "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
