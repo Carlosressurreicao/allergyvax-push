@@ -1,6 +1,6 @@
-// /api/push.js — GoodBarber Push: headers + fallback em query string
+/// /api/push.js — GoodBarber Classic API (GENERAL) com suporte a grupo por ID ou nome
 export default async function handler(req, res) {
-  // CORS
+  // CORS básico
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key");
@@ -9,101 +9,131 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ ok: false, error: "Method not allowed" });
 
   try {
-    // body: aceita JSON ou text/plain
+    // Aceita JSON ou text/plain
     let body = req.body;
     if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
     if (!body || typeof body !== "object") body = {};
 
-    const { message, group = null, action = null, scheduleAt = null } = body;
+    const {
+      message,
+      group = null,             // pode ser null, "123" (ID), ou "nome/slug"
+      platform = "pwa"          // default p/ seu caso (PWA)
+    } = body;
+
     if (!message || typeof message !== "string" || !message.trim())
-      return res.status(400).json({ ok: false, error: "Missing 'message'." });
+      return res.status(400).json({ ok:false, error:"Missing 'message'." });
     if (message.length > 130)
-      return res.status(400).json({ ok: false, error: "Message exceeds 130 chars." });
+      return res.status(400).json({ ok:false, error:"Message exceeds 130 chars (max ~130)." });
 
+    // ENV
     const base = (process.env.GB_API_BASE || "https://allergyvax.goodbarber.app").replace(/\/+$/,"");
-    const appId = process.env.GB_APP_ID;
-    const token = process.env.GB_API_TOKEN;
-    const path  = "/publicapi/v1/push"; // já confirmado pelo seu retorno
+    const appId = process.env.GB_APP_ID;           // ex.: 3785328
+    const token = process.env.GB_API_TOKEN;        // JWT da Public API com módulo Notifications/Push (Write)
+    if (!appId || !token) return res.status(500).json({ ok:false, error:"Missing GB_APP_ID or GB_API_TOKEN" });
 
-    if (!appId || !token) {
-      return res.status(500).json({ ok: false, error: "Missing GB_APP_ID or GB_API_TOKEN" });
-    }
-
-    // Map ação (abre app por padrão)
-    let gbAction = { type: "open_app" };
-    if (action?.type === "external_url" && action.value) gbAction = { type: "external_url", url: action.value };
-    if (action?.type === "section"      && action.value) gbAction = { type: "section", section_id: action.value };
-
-    const payload = {
-      message: message.trim(),
-      platforms: ["pwa"],
-      ...(group ? { groups: [group] } : {}),
-      action: gbAction,
-      ...(scheduleAt ? { schedule_at: new Date(scheduleAt).toISOString() } : {})
+    // Headers aceitos pela Classic API (variam por instância; enviamos todos)
+    const gbHeaders = {
+      "Accept": "application/json",
+      "Content-Type": "application/json",
+      "X-GB-APP-ID": String(appId),
+      "Authorization": `Bearer ${token}`,
+      "X-GB-API-TOKEN": token
     };
 
-    // helper para detectar “login page”
+    // Função helper: detectar HTML de login
     const looksLikeLoginHtml = (text, ctype) =>
       (ctype && ctype.includes("text/html")) ||
-      (typeof text === "string" && /Please enter a password|<html|<form/i.test(text));
+      (typeof text === "string" && /<html|Please enter a password/i.test(text));
 
-    // 1) Tentativa com HEADERS
-    const url = `${base}${path}`;
-    let r = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "X-GB-APP-ID": appId,
-        "Authorization": `Bearer ${token}`,
-        "X-GB-API-TOKEN": token
-      },
-      body: JSON.stringify(payload),
-      redirect: "manual" // evita seguir redirecionamento para página de login
-    });
+    // Se não houver group => broadcast
+    if (!group) {
+      const url = `${base}/publicapi/v1/general/push/${appId}/`;
+      const r = await fetch(url, {
+        method: "POST",
+        headers: gbHeaders,
+        body: JSON.stringify({ platform, message: message.trim() }),
+        redirect: "manual"
+      });
+      const raw = await r.text();
+      const ct  = r.headers.get("content-type") || "";
+      let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
 
-    let raw = await r.text();
-    const ctype = r.headers.get("content-type") || "";
+      if (!r.ok || looksLikeLoginHtml(raw, ct)) {
+        return res.status( (looksLikeLoginHtml(raw, ct) && r.ok) ? 403 : r.status ).json({
+          ok: false,
+          error: looksLikeLoginHtml(raw, ct) ? "GoodBarber login page — habilite Notifications/Push (Write) e libere a Public API" : "GoodBarber error",
+          providerStatus: r.status,
+          contentType: ct,
+          providerBody: data
+        });
+      }
+      return res.status(200).json({ ok:true, provider:"GoodBarber", mode:"broadcast", result:data });
+    }
+
+    // Há group: preparar envio por grupos
+    // Se for número, usa direto. Se for texto, tentamos mapear via /community/groups
+    const groupIds = [];
+
+    if (/^\d+$/.test(String(group))) {
+      groupIds.push(parseInt(group, 10));
+    } else {
+      // Buscar lista de grupos e tentar casar por name/slug insensível a maiúsculas
+      const listURL = `${base}/publicapi/v1/general/community/${appId}/groups/`;
+      const lr = await fetch(listURL, { headers: gbHeaders, redirect: "manual" });
+      const lraw = await lr.text();
+      const lct  = lr.headers.get("content-type") || "";
+      let ljson; try { ljson = JSON.parse(lraw); } catch { ljson = { raw: lraw }; }
+
+      if (!lr.ok || looksLikeLoginHtml(lraw, lct)) {
+        return res.status( (looksLikeLoginHtml(lraw, lct) && lr.ok) ? 403 : lr.status ).json({
+          ok:false,
+          error: "Failed to list groups (auth/perm). Habilite Notifications/Push (Write) e libere a Public API.",
+          providerStatus: lr.status,
+          contentType: lct,
+          providerBody: ljson
+        });
+      }
+
+      // tentar casar por 'name' ou 'slug' aproximado
+      const wanted = String(group).trim().toLowerCase();
+      const groupsArr = Array.isArray(ljson.groups) ? ljson.groups : [];
+      const found = groupsArr.find(g => {
+        const n = (g.name || "").toString().toLowerCase();
+        const s = (g.slug || "").toString().toLowerCase();
+        return n === wanted || s === wanted;
+      });
+
+      if (!found || !found.id) {
+        return res.status(404).json({
+          ok:false,
+          error:`Group not found by name/slug: "${group}". Use ID inteiro (ex.: 10123) ou crie um nome/slug que corresponda exatamente.`
+        });
+      }
+      groupIds.push(parseInt(found.id, 10));
+    }
+
+    // Envio por grupos
+    const url = `${base}/publicapi/v1/general/push/groups/${appId}/`;
+    const payload = { platform, message: message.trim(), groups: groupIds };
+    const r = await fetch(url, { method:"POST", headers: gbHeaders, body: JSON.stringify(payload), redirect:"manual" });
+    const raw = await r.text();
+    const ct  = r.headers.get("content-type") || "";
     let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
 
-    if (r.ok && !looksLikeLoginHtml(raw, ctype)) {
-      return res.status(200).json({ ok: true, provider: "GoodBarber", urlUsed: url, auth: "headers", result: data });
+    if (!r.ok || looksLikeLoginHtml(raw, ct)) {
+      return res.status( (looksLikeLoginHtml(raw, ct) && r.ok) ? 403 : r.status ).json({
+        ok:false,
+        error: looksLikeLoginHtml(raw, ct) ? "GoodBarber login page — habilite Notifications/Push (Write) e libere a Public API." : "GoodBarber error",
+        providerStatus: r.status,
+        contentType: ct,
+        providerBody: data
+      });
     }
 
-    // 2) Fallback: tenta por QUERY STRING
-    const urlQS = `${base}${path}?app_id=${encodeURIComponent(appId)}&api_token=${encodeURIComponent(token)}`;
-    r = await fetch(urlQS, {
-      method: "POST",
-      headers: {
-        "Accept": "application/json",
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(payload),
-      redirect: "manual"
-    });
-
-    raw = await r.text();
-    const ctype2 = r.headers.get("content-type") || "";
-    let data2; try { data2 = JSON.parse(raw); } catch { data2 = { raw }; }
-
-    if (r.ok && !looksLikeLoginHtml(raw, ctype2)) {
-      return res.status(200).json({ ok: true, provider: "GoodBarber", urlUsed: urlQS, auth: "querystring", result: data2 });
-    }
-
-    // Se ainda veio HTML/login, reporte detalhe
-    return res.status(502).json({
-      ok: false,
-      error: "Auth/permissions issue at GoodBarber (login HTML received)",
-      tried: [
-        { url, mode: "headers", status: r.status, contentType: ctype, sample: (typeof data === "object" ? undefined : String(raw).slice(0,200)) },
-        { url: urlQS, mode: "querystring", status: r.status, contentType: ctype2, sample: (typeof data2 === "object" ? undefined : String(raw).slice(0,200)) }
-      ],
-      hint: "Verifique se a sua chave Public API tem o módulo Push/Notifications com Write e se este endpoint permite auth por headers e/ou query na sua instância."
-    });
+    return res.status(200).json({ ok:true, provider:"GoodBarber", mode:"groups", groups: groupIds, result:data });
 
   } catch (err) {
     console.error("[push][fatal]", err);
-    return res.status(500).json({ ok: false, error: "Internal error", detail: String(err) });
+    return res.status(500).json({ ok:false, error:"Internal error", detail:String(err) });
   }
 }
-
