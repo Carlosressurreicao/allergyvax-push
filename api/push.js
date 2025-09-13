@@ -1,5 +1,6 @@
 // /api/push.js
 export default async function handler(req, res) {
+  // CORS p/ chamar do seu PWA
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Requested-With");
@@ -10,45 +11,38 @@ export default async function handler(req, res) {
     const { title, message, deepLink } = req.body || {};
     if (!title || !message) return res.status(400).json({ ok:false, error:"Informe 'title' e 'message'." });
 
-    const base = process.env.GB_API_BASE;
-    const key  = process.env.GB_API_KEY;
+    const base = process.env.GB_API_BASE;  // ex.: https://classic.goodbarber.dev/publicapi/v1/apps/3785328
+    const key  = process.env.GB_API_KEY;   // token da Public API (Settings > Public APIs)
     if (!base || !key) return res.status(500).json({ ok:false, error:"GB_API_BASE/GB_API_KEY ausentes." });
 
+    const url = `${base.replace(/\/+$/, "")}/push/broadcasts`; // garante sem barra dupla
+
     const payload = {
-      title, message,
-      platforms: ["pwa"], groups: [],
+      title,
+      message,
+      platforms: ["pwa"],         // SOMENTE PWA
+      groups: [],                 // TODOS
       action: deepLink ? { type: "url", value: deepLink } : undefined
     };
 
-    const urls = [
-      `${base}/push/broadcasts`,
-      `${base}/notifications/broadcasts`
-    ];
-    const auths = [
-      { "X-Auth-Token": key },
-      { "Authorization": `Token ${key}` }
-    ];
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Auth-Token": key      // <- header mais aceito na Public API Classic
+      },
+      body: JSON.stringify(payload)
+    });
 
-    let last = null;
-    for (const url of urls) {
-      for (const hdr of auths) {
-        const resp = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type":"application/json", ...hdr },
-          body: JSON.stringify(payload)
-        });
-        const txt = await resp.text();
-        last = { url, hdr, status: resp.status, body: txt.slice(0, 1000) };
-        if (resp.ok) {
-          let json; try{ json = JSON.parse(txt) } catch { json = { raw: txt } }
-          return res.status(200).json({ ok:true, provider:"goodbarber", response: json });
-        }
-        if (resp.status === 401 || resp.status === 403) break;
-      }
+    const text = await resp.text();
+    if (!resp.ok) {
+      return res.status(resp.status).json({ ok:false, status: resp.status, gb: { url, raw: text.slice(0, 2000) } });
     }
-    return res.status(502).json({ ok:false, hint:"Falha ao criar broadcast", last_try: last });
+
+    let json; try { json = JSON.parse(text); } catch { json = { raw: text }; }
+    return res.status(200).json({ ok:true, provider:"goodbarber", response: json });
+
   } catch (e) {
     return res.status(500).json({ ok:false, error: String(e?.message || e) });
   }
 }
-
