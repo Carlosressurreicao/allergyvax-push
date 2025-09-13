@@ -1,6 +1,6 @@
-// /api/push.js — GoodBarber Classic API (broadcast)
+// /api/push.js — GoodBarber Classic API (broadcast PWA)
 export default async function handler(req, res) {
-  // CORS
+  // CORS básico
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key");
@@ -9,21 +9,19 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ ok: false, error: "Method not allowed" });
 
   try {
-    // body: aceita JSON ou text/plain
+    // aceita JSON ou text/plain
     let body = req.body;
     if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
     if (!body || typeof body !== "object") body = {};
 
     const message  = (body.message || "").trim();
     const platform = (body.platform || "pwa").toLowerCase(); // default PWA
-
     if (!message) return res.status(400).json({ ok:false, error:"Missing 'message'." });
     if (!["all","pwa","ios","android"].includes(platform))
-      return res.status(400).json({ ok:false, error:"Invalid 'platform'. Use one of: all, pwa, ios, android." });
+      return res.status(400).json({ ok:false, error:"Invalid 'platform'. Use: all | pwa | ios | android." });
     if (message.length > 130)
       return res.status(400).json({ ok:false, error:"Message exceeds ~130 chars." });
 
-    // ENV
     const base  = (process.env.GB_API_BASE || "https://allergyvax.goodbarber.app").replace(/\/+$/,"");
     const appId = process.env.GB_APP_ID;      // ex.: 3785328
     const token = process.env.GB_API_TOKEN;   // token do Key Set com Notifications/Push (Write)
@@ -67,3 +65,4 @@ export default async function handler(req, res) {
     return res.status(500).json({ ok:false, error:"Internal error", detail:String(e) });
   }
 }
+
