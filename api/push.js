@@ -1,68 +1,68 @@
-// /api/push.js — GoodBarber Classic API (broadcast PWA)
+// File: api/push.js
 export default async function handler(req, res) {
-  // CORS básico
+  // Permite CORS (ajuste o domínio em produção)
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Auth-Token");
+
   if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method === "GET") return res.status(200).json({ ok: true, endpoint: "push", status: "ready" });
-  if (req.method !== "POST") return res.status(405).json({ ok: false, error: "Method not allowed" });
+  if (req.method !== "POST") {
+    return res.status(405).json({ ok: false, error: "Method not allowed" });
+  }
 
   try {
-    // aceita JSON ou text/plain
-    let body = req.body;
-    if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
-    if (!body || typeof body !== "object") body = {};
+    // 1) Preferir variáveis de ambiente da Vercel
+    const APP_ID_ENV  = process.env.GB_APP_ID;
+    const API_KEY_ENV = process.env.GB_API_KEY;
 
-    const message  = (body.message || "").trim();
-    const platform = (body.platform || "pwa").toLowerCase(); // default PWA
-    if (!message) return res.status(400).json({ ok:false, error:"Missing 'message'." });
-    if (!["all","pwa","ios","android"].includes(platform))
-      return res.status(400).json({ ok:false, error:"Invalid 'platform'. Use: all | pwa | ios | android." });
-    if (message.length > 130)
-      return res.status(400).json({ ok:false, error:"Message exceeds ~130 chars." });
+    // 2) Body do cliente (HTML) pode enviar appId/apiKey se você preferir sobrescrever
+    const { appId: appIdFromBody, apiKey: apiKeyFromBody, payload } = req.body || {};
 
-    const base  = (process.env.GB_API_BASE || "https://allergyvax.goodbarber.app").replace(/\/+$/,"");
-    const appId = process.env.GB_APP_ID;      // ex.: 3785328
-    const token = process.env.GB_API_TOKEN;   // token do Key Set com Notifications/Push (Write)
-    if (!appId || !token) return res.status(500).json({ ok:false, error:"Missing GB_APP_ID or GB_API_TOKEN" });
+    const appId = (appIdFromBody || APP_ID_ENV || "").trim();
+    const apiKey = (apiKeyFromBody || API_KEY_ENV || "").trim();
 
-    const url = `${base}/publicapi/v1/general/push/${appId}/`;
-
-    const r = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "X-GB-APP-ID": String(appId),
-        "Authorization": `Bearer ${token}`,
-        "X-GB-API-TOKEN": token
-      },
-      body: JSON.stringify({ platform, message }),
-      redirect: "manual"
-    });
-
-    const raw = await r.text();
-    const ct  = r.headers.get("content-type") || "";
-    let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
-
-    const isLoginHTML = /text\/html/i.test(ct) || /<html|Please enter a password/i.test(raw);
-    if (!r.ok || isLoginHTML) {
-      return res.status( (isLoginHTML && r.ok) ? 403 : r.status ).json({
-        ok:false,
-        error: isLoginHTML
-          ? "GoodBarber login page — habilite Notifications/Push (Write) no Key Set e libere a Public API (sem password/IP)."
-          : "GoodBarber error",
-        providerStatus: r.status,
-        contentType: ct,
-        providerBody: data
+    if (!appId || !apiKey) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing credentials",
+        hint: "Defina GB_APP_ID e GB_API_KEY no painel da Vercel ou envie appId/apiKey no body."
+      });
+    }
+    if (!payload || typeof payload !== "object") {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing payload",
+        example: {
+          title: "Alerta",
+          text: "Texto da notificação",
+          target: { platform: ["ios","android","pwa"], groups: ["SCIT"] },
+          deeplink: { type: "url", value: "https://seuapp..." }
+        }
       });
     }
 
-    return res.status(200).json({ ok:true, provider:"GoodBarber", mode:"broadcast", result:data });
-  } catch (e) {
-    console.error("[push][fatal]", e);
-    return res.status(500).json({ ok:false, error:"Internal error", detail:String(e) });
+    const url = `https://api.goodbarber.com/1/${encodeURIComponent(appId)}/push`;
+
+    const upstream = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-GoodBarber-ApiKey": apiKey
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const text = await upstream.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = { raw: text }; }
+
+    return res.status(upstream.status).json({
+      ok: upstream.ok,
+      status: upstream.status,
+      data
+    });
+  } catch (err) {
+    return res.status(500).json({ ok:false, error: String(err) });
   }
 }
 
