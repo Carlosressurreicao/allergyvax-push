@@ -1,0 +1,6 @@
+{
+  "crons": [
+    { "path": "/api/push-cron?mode=daily",    "schedule": "0 12 * * *" },
+    { "path": "/api/push-cron?mode=overdue10","schedule": "10 12 * * *" }
+  ]
+}
