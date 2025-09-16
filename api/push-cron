@@ -1,0 +1,161 @@
+// /api/push-cron.js
+export default async function handler(req, res) {
+  try {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const mode = url.searchParams.get('mode') || 'daily';
+    const dryRun = url.searchParams.get('dryRun') === '1';
+
+    // --- ENV (configure na Vercel) ---
+    const GB_APP_ID    = process.env.GB_APP_ID;       // ex: 3785328
+    const GB_API_TOKEN = process.env.GB_API_TOKEN;    // token Classic Public API
+    const AIRTABLE_PAT = process.env.AIRTABLE_PAT;    // pat...
+    const AIRTABLE_BASE_ID = process.env.AIRTABLE_BASE_ID;
+
+    // Tabelas/campos (ajuste aos seus nomes reais)
+    const TBL_GRUPOS = process.env.AIRTABLE_TABLE_GROUPS || 'PUSH_GRUPOS';
+    // Tabela onde estão pacientes com atraso e o mapeamento p/ grupo
+    const TBL_ATRASO = process.env.AIRTABLE_TABLE_OVERDUE || 'PACIENTES';
+    // Campo numérico já calculado no Airtable (recomendado)
+    const FLD_DIAS_ATRASO = process.env.AIRTABLE_FIELD_DIAS_ATRASO || 'dias_atraso';
+    // Alternativamente, defina dois campos de data para calcular atraso no JS:
+    const FLD_DATA_REFERENCIA = process.env.AIRTABLE_FIELD_DATA_REFERENCIA || ''; // ex: 'proxima_data'
+    const FLD_HOJE_ANCORADO   = process.env.AIRTABLE_FIELD_HOJE || ''; // se usar fórmula no AT, deixe vazio aqui
+
+    // Mensagens
+    const DAILY_TITLE   = process.env.DAILY_TITLE   || 'AllergyVax';
+    const DAILY_MESSAGE = process.env.DAILY_MESSAGE || 'Lembrete diário: verifique suas pendências no app.';
+    const OVERDUE_TITLE = process.env.OVERDUE_TITLE || 'Lembrete de tratamento';
+    const OVERDUE_MSG   = process.env.OVERDUE_MSG   || 'Você está com atraso no tratamento. Agende sua aplicação.';
+
+    if (!GB_APP_ID || !GB_API_TOKEN) {
+      return res.status(500).json({ ok:false, error:'GB_APP_ID/GB_API_TOKEN not set' });
+    }
+    if (!AIRTABLE_PAT || !AIRTABLE_BASE_ID) {
+      return res.status(500).json({ ok:false, error:'Airtable credentials not set' });
+    }
+
+    let groupIds = [];
+    let gbPayload;
+    if (mode === 'daily') {
+      // Pega grupos ativos para o push diário (ou deixa vazio para broadcast)
+      groupIds = await getActiveGroupsFromAirtable({ pat: AIRTABLE_PAT, baseId: AIRTABLE_BASE_ID, table: TBL_GRUPOS });
+      gbPayload = buildGbPayload({
+        title: DAILY_TITLE,
+        message: DAILY_MESSAGE,
+        groups: groupIds
+      });
+    } else if (mode === 'overdue10') {
+      // Busca grupos onde existam pacientes com atraso >=10
+      groupIds = await getOverdueGroupsFromAirtable({
+        pat: AIRTABLE_PAT, baseId: AIRTABLE_BASE_ID, table: TBL_ATRASO,
+        fldDiasAtraso: FLD_DIAS_ATRASO, minDias: 10,
+        fldDataRef: FLD_DATA_REFERENCIA, fldHoje: FLD_HOJE_ANCORADO
+      });
+      gbPayload = buildGbPayload({
+        title: OVERDUE_TITLE,
+        message: OVERDUE_MSG,
+        groups: groupIds
+      });
+    } else {
+      return res.status(400).json({ ok:false, error:`Unknown mode "${mode}"` });
+    }
+
+    if (dryRun) {
+      return res.status(200).json({ ok:true, dryRun:true, mode, groups: groupIds, payload: gbPayload });
+    }
+
+    // Envia push (se groups vazio => broadcast)
+    const r = await sendGoodBarberPush({ appId: GB_APP_ID, token: GB_API_TOKEN, payload: gbPayload });
+    return res.status(r.ok ? 200 : (r.status || 500)).json({ ok:r.ok, mode, request:{groups:groupIds}, response:r.json || r.text });
+
+  } catch (err) {
+    return res.status(500).json({ ok:false, error:String(err?.message || err) });
+  }
+}
+
+/* ----------------- Helpers ----------------- */
+function truncatePwa(txt, max=130){ return (txt && txt.length>max) ? (txt.slice(0,max-1)+'…') : txt; }
+
+function buildGbPayload({ title, message, deepLink, groups=[] }) {
+  return {
+    title,
+    message: truncatePwa(message, 130),
+    ...(deepLink ? { deep_link: deepLink } : {}),
+    platforms: ['ios','android','pwa'],
+    ...(groups.length ? { groups } : {})   // omitido => broadcast
+  };
+}
+
+async function sendGoodBarberPush({ appId, token, payload }) {
+  const url = `https://classic.goodbarber.dev/publicapi/v1/general/push/${encodeURIComponent(appId)}/`;
+  const resp = await fetch(url, {
+    method:'POST',
+    headers:{ 'Content-Type':'application/json', 'token': token },
+    body: JSON.stringify(payload)
+  });
+  try { return { ok:resp.ok, status:resp.status, json: await resp.json() }; }
+  catch { return { ok:resp.ok, status:resp.status, text: await resp.text() }; }
+}
+
+async function getActiveGroupsFromAirtable({ pat, baseId, table }) {
+  const url = `https://api.airtable.com/v0/${baseId}/${encodeURIComponent(table)}?filterByFormula=${encodeURIComponent(`{ativo}=1`)}`;
+  const j = await atGet(url, pat);
+  const ids = [];
+  for (const r of j.records || []) {
+    const gid = r.fields?.group_id;
+    if (gid !== undefined && gid !== null && `${gid}`.trim() !== '') ids.push(Number(gid));
+  }
+  return [...new Set(ids)];
+}
+
+async function getOverdueGroupsFromAirtable({ pat, baseId, table, fldDiasAtraso, minDias=10, fldDataRef, fldHoje }) {
+  // Opção A (recomendada): já existir campo {dias_atraso} no Airtable
+  if (fldDiasAtraso) {
+    const formula = `AND( VALUE({${fldDiasAtraso}}) >= ${minDias} , {group_id} != BLANK() , {consent_push}=1 )`;
+    const url = `https://api.airtable.com/v0/${baseId}/${encodeURIComponent(table)}?fields[]=group_id&filterByFormula=${encodeURIComponent(formula)}`;
+    const j = await atGet(url, pat);
+    const ids = [];
+    for (const r of j.records || []) {
+      const gid = r.fields?.group_id;
+      if (gid !== undefined && gid !== null && `${gid}`.trim() !== '') ids.push(Number(gid));
+    }
+    return [...new Set(ids)];
+  }
+
+  // Opção B: calcular atraso no backend por datas (se você não tiver {dias_atraso} pronto)
+  // Atenção: paginar se a tabela for grande.
+  // Aqui, trazemos somente registros com group_id e consent_push=1, e filtramos no Node.
+  const baseUrl = `https://api.airtable.com/v0/${baseId}/${encodeURIComponent(table)}`;
+  const formula = `AND({group_id}!=BLANK(), {consent_push}=1)`;
+  let offset, ids = [];
+
+  do {
+    const url = new URL(baseUrl);
+    url.searchParams.set('fields[]', 'group_id');
+    if (fldDataRef) url.searchParams.set('fields[]', fldDataRef);
+    if (fldHoje)     url.searchParams.set('fields[]', fldHoje);
+    url.searchParams.set('filterByFormula', formula);
+    if (offset) url.searchParams.set('offset', offset);
+    const j = await atGet(url.toString(), pat);
+    for (const r of j.records || []) {
+      const gid = r.fields?.group_id;
+      const refDate = r.fields?.[fldDataRef]; // ISO string
+      // Se houver campo "hoje" ancorado no AT, use; senão use Date.now() no backend:
+      const today = fldHoje && r.fields?.[fldHoje] ? new Date(r.fields[fldHoje]) : new Date();
+      let diff = 0;
+      if (refDate) {
+        diff = Math.floor((today - new Date(refDate)) / (24*60*60*1000));
+      }
+      if (gid && diff >= minDias) ids.push(Number(gid));
+    }
+    offset = j.offset;
+  } while (offset);
+
+  return [...new Set(ids)];
+}
+
+async function atGet(url, pat) {
+  const r = await fetch(url, { headers: { Authorization:`Bearer ${pat}` } });
+  if (!r.ok) throw new Error(`Airtable ${r.status}: ${await r.text()}`);
+  return r.json();
+}
